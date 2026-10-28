@@ -1,0 +1,30 @@
+# Supprime les branches tmp-* (photos hébergées le temps qu'Instagram les récupère)
+# une heure après leur création.
+name: Ménage des branches temporaires
+
+on:
+  schedule:
+    - cron: "17 * * * *"   # toutes les heures
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Supprimer les branches tmp-* de plus d'une heure
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          limit=$(date -u -d '1 hour ago' +%s)
+          gh api "repos/$REPO/branches" --paginate --jq '.[].name | select(startswith("tmp-"))' |
+          while read -r branch; do
+            date=$(gh api "repos/$REPO/commits/$branch" --jq '.commit.committer.date')
+            if [ "$(date -u -d "$date" +%s)" -lt "$limit" ]; then
+              echo "Suppression de $branch ($date)"
+              gh api -X DELETE "repos/$REPO/git/refs/heads/$branch"
+            fi
+          done
