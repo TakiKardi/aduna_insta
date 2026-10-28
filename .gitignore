@@ -1,0 +1,5 @@
+# Données locales du pipeline (photos, journal) : elles restent dans les fichiers du projet Claude
+cache/
+out/
+journal.json
+__pycache__/
