@@ -21,7 +21,9 @@ from pathlib import Path
 import requests
 from PIL import Image, ImageOps
 
-ALBUM_TOKEN = "013P7_YVnUH7tkMk2CxmGqnNQ"
+# Lien « Site web public » de l'album (icloud.com/sharedalbum/#…). L'ancien lien
+# photos.icloud.com/shared/album/… (CloudKit) reste lisible par fetch_album_cloudkit.
+ALBUM_URL = "https://www.icloud.com/sharedalbum/#D1zv3MTp-Ua88aJyL7HxVzp84tACAEQARogjyJPh2gNOhpAIvUJQ_9plEfZGLd_LwycnvRuz0Js6Z8"
 IG_USER_ID = "17841480895256563"
 GRAPH = "https://graph.instagram.com/v21.0"
 
@@ -65,17 +67,78 @@ def _ck_post(url, body):
 
 
 def fetch_album():
+    if "/sharedalbum/#" in ALBUM_URL:
+        return fetch_album_sharedstreams(ALBUM_URL.split("#", 1)[1])
+    return fetch_album_cloudkit(ALBUM_URL.rstrip("/").rsplit("/", 1)[1])
+
+
+SHAREDSTREAMS_VIDEO = ("1080p", "720p", "360p")  # meilleure qualité d'abord
+
+
+def fetch_album_sharedstreams(token):
+    """Lit un album partagé classique (« Site web public »), sans compte Apple.
+    1) webstream liste les éléments et leurs dérivés (tailles d'image, qualités vidéo) ;
+       la première réponse peut être un 330 qui indique le bon serveur ;
+    2) webasseturls donne l'URL de téléchargement de chaque dérivé choisi."""
+    host = "p23-sharedstreams.icloud.com"
+    for _ in range(3):
+        r = requests.post(f"https://{host}/{token}/sharedstreams/webstream",
+                          data=json.dumps({"streamCtag": None}), timeout=30)
+        if r.status_code == 330:
+            host = r.json()["X-Apple-MMe-Host"]
+            continue
+        if r.status_code == 404:
+            sys.exit("Album iCloud introuvable (404). Vérifier que « Site web public » est activé "
+                     "et mettre à jour ALBUM_URL.")
+        r.raise_for_status()
+        break
+    stream = r.json()
+    base = f"https://{host}/{token}/sharedstreams"
+    picked = {}
+    for ph in stream.get("photos", []):
+        ders = ph.get("derivatives", {})
+        is_video = ph.get("mediaAssetType") == "video"
+        if is_video:
+            key = next((k for k in SHAREDSTREAMS_VIDEO if k in ders), None)
+        else:  # dérivés image nommés par leur taille : on prend le plus grand
+            sizes = [k for k in ders if k.isdigit()]
+            key = max(sizes, key=lambda k: int(ders[k].get("width", 0)), default=None)
+        if key:
+            picked[ph["photoGuid"]] = (ph, ders[key]["checksum"], is_video)
+    guids = list(picked)
+    urls = {}
+    for i in range(0, len(guids), 25):
+        items = requests.post(f"{base}/webasseturls", data=json.dumps({"photoGuids": guids[i:i + 25]}),
+                              timeout=30).json().get("items", {})
+        urls.update({k: f"https://{v['url_location']}{v['url_path']}" for k, v in items.items()})
+    out = []
+    for g, (ph, checksum, is_video) in picked.items():
+        if checksum not in urls:
+            continue
+        date = ph.get("dateCreated")
+        out.append({
+            "guid": g,
+            # même unité que CloudKit (ms depuis 1970) pour reconnaître les photos déjà connues
+            "date": int(datetime.fromisoformat(date.replace("Z", "+00:00")).timestamp() * 1000) if date else None,
+            "by": ph.get("contributorFullName"),
+            "url": urls[checksum],
+            "is_video": is_video,
+        })
+    return out
+
+
+def fetch_album_cloudkit(album_token):
     """Lit l'album partagé (« SharedCollection » CloudKit), sans compte Apple.
     1) resolve donne la partition, la zone et un jeton anonyme valable 20 min ;
     2) records/changes liste les CPLAsset (photo retouchée) et CPLMaster (original) ;
     3) on prend le JPEG 2048 px : retouché si dispo, sinon celui de l'original."""
     res = _ck_post(f"https://ckdatabasews.icloud.com/{CK}/public/records/resolve"
                    "?remapEnums=true&getCurrentSyncToken=true",
-                   {"shortGUIDs": [{"value": ALBUM_TOKEN}]})["results"][0]
+                   {"shortGUIDs": [{"value": album_token}]})["results"][0]
     if res.get("serverErrorCode") or "anonymousPublicAccess" not in res:
         # album supprimé, lien régénéré ou partage public coupé : inutile d'aller plus loin
         sys.exit(f"Album iCloud introuvable ({res.get('serverErrorCode')}: {res.get('reason')}). "
-                 f"Vérifier le lien partagé et mettre à jour ALBUM_TOKEN.")
+                 f"Vérifier le lien partagé et mettre à jour ALBUM_URL.")
     zone = res["rootRecord"]["zoneID"] if "rootRecord" in res else res["zoneID"]
     token = res["anonymousPublicAccess"]["token"]
     base = res["anonymousPublicAccess"].get("databasePartition") or res["databasePartition"]
@@ -118,12 +181,43 @@ def fetch_album():
     return out
 
 
+def dhash(path):
+    """Empreinte de 256 bits : quasi identique pour une même photo, quelle que soit sa taille."""
+    im = Image.open(path).convert("L").resize((17, 16))
+    px = im.tobytes()
+    return [px[r * 17 + c] > px[r * 17 + c + 1] for r in range(16) for c in range(16)]
+
+
+def known_twin(j, entry, path):
+    """Le même cliché déjà au journal sous un autre identifiant (l'album a changé de lien) ?
+    D'abord par la date de prise de vue, puis, pour une photo, par son empreinte."""
+    if entry["date"]:
+        for g, p in j["photos"].items():
+            if p.get("date") and abs(p["date"] - entry["date"]) <= 2000 and p.get("kind", "photo") == entry["kind"]:
+                return g
+    if entry["kind"] == "photo" and path:
+        h = dhash(path)
+        for g, p in j["photos"].items():
+            f = Path(p["file"])
+            if p.get("kind", "photo") == "photo" and f.exists():
+                if sum(x != y for x, y in zip(h, dhash(f))) <= 8:  # deux photos différentes : 37 et plus
+                    return g
+    return None
+
+
 def cmd_scan():
     j = load_journal()
+    j.setdefault("aliases", {})
     CACHE.mkdir(exist_ok=True)
     new = []
     for a in fetch_album():
-        if a["guid"] in j["photos"]:
+        if a["guid"] in j["photos"] or a["guid"] in j["aliases"]:
+            continue
+        kind = "video" if a["is_video"] else "photo"
+        entry = {"status": "new", "date": a["date"], "by": a["by"], "kind": kind}
+        twin = known_twin(j, entry, None)
+        if twin:
+            j["aliases"][a["guid"]] = twin
             continue
         dest = CACHE / f"{a['guid']}.{'mov' if a['is_video'] else 'jpg'}"
         with requests.get(a["url"], timeout=300, stream=True) as r:
@@ -131,12 +225,16 @@ def cmd_scan():
             with dest.open("wb") as fh:
                 for chunk in r.iter_content(1 << 20):
                     fh.write(chunk)
-        j["photos"][a["guid"]] = {"status": "new", "date": a["date"], "by": a["by"], "file": str(dest),
-                                  "kind": "video" if a["is_video"] else "photo"}
+        twin = known_twin(j, {**entry, "date": None}, dest)
+        if twin:
+            j["aliases"][a["guid"]] = twin
+            dest.unlink()
+            continue
+        j["photos"][a["guid"]] = {**entry, "file": str(dest)}
         new.append(str(dest))
     save_journal(j)
     pending = [g for g, p in j["photos"].items() if p["status"] == "new"]
-    print(json.dumps({"downloaded": new, "pending": pending}, indent=2))
+    print(json.dumps({"downloaded": new, "pending": pending, "already_known": len(j["aliases"])}, indent=2))
 
 
 # ---------- préparation des images ----------
