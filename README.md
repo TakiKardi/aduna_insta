@@ -11,7 +11,14 @@ Publication automatique des photos du chantier d'Aduna sur Instagram ([@aduna.se
 
 ## Le code
 
-- `pipeline/aduna_insta.py` : `scan` (lecture de l'album iCloud via CloudKit), `prepare` (bandes noires si le ratio sort de 4:5 à 1,91:1, jamais de recadrage), `publish` (hébergement temporaire et publication via l'API Instagram), `quota` (cadence du jour).
+- `pipeline/aduna_insta.py` : `scan` (lecture de l'album iCloud via CloudKit, photos et vidéos), `prepare` (bandes noires si le ratio sort de 4:5 à 1,91:1, jamais de recadrage ; vidéos réencodées en MP4), `frames` (quatre images d'une vidéo pour choisir sa légende), `publish` (hébergement temporaire et publication via l'API Instagram), `quota` (cadence du jour).
+
+## Vidéos
+
+- Une vidéo seule part en **Reel** (aussi visible dans la grille). Le cadre peut aller jusqu'au 9:16 vertical.
+- Une vidéo peut entrer dans un **carrousel** avec des photos si elle dure 60 s ou moins ; son cadre suit alors la règle des photos (4:5 à 1,91:1).
+- `prepare` doit être lancé sur le groupe exact du post : une vidéo préparée pour un Reel n'est pas acceptée dans un carrousel, et inversement.
+- Le son d'origine est gardé ; une vidéo muette reçoit une piste silencieuse.
 - `pipeline/batch_publish.py` : publie une série de plans validés, avec une pause entre chaque post, et reprend là où il s'est arrêté.
 - `.github/workflows/cleanup-tmp-branches.yml` : supprime toutes les heures les branches `tmp-*` qui ont servi à héberger les photos le temps qu'Instagram les récupère.
 
