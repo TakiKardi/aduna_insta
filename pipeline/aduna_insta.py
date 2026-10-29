@@ -72,6 +72,10 @@ def fetch_album():
     res = _ck_post(f"https://ckdatabasews.icloud.com/{CK}/public/records/resolve"
                    "?remapEnums=true&getCurrentSyncToken=true",
                    {"shortGUIDs": [{"value": ALBUM_TOKEN}]})["results"][0]
+    if res.get("serverErrorCode") or "anonymousPublicAccess" not in res:
+        # album supprimé, lien régénéré ou partage public coupé : inutile d'aller plus loin
+        sys.exit(f"Album iCloud introuvable ({res.get('serverErrorCode')}: {res.get('reason')}). "
+                 f"Vérifier le lien partagé et mettre à jour ALBUM_TOKEN.")
     zone = res["rootRecord"]["zoneID"] if "rootRecord" in res else res["zoneID"]
     token = res["anonymousPublicAccess"]["token"]
     base = res["anonymousPublicAccess"].get("databasePartition") or res["databasePartition"]
