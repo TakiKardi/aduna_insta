@@ -27,14 +27,15 @@ for i, p in enumerate(plans):
     plan = json.loads(p.read_text())
     try:
         if dry:
-            branch, urls = a.host_images([a.OUT / f"{g}.jpg" for g in plan["guids"]])
+            j = a.load_journal()
+            a.check_plan(plan, j)
+            entries = [j["photos"][g] for g in plan["guids"]]
+            branch, urls = a.host_images([a.out_file(g, e) for g, e in zip(plan["guids"], entries)])
             try:
-                children = [a.ig("POST", f"{a.IG_USER_ID}/media", image_url=u, is_carousel_item="true")["id"] for u in urls]
-                for c in children:
-                    a.wait_ready(c)
+                a.create_containers([(u, e.get("kind", "photo")) for u, e in zip(urls, entries)], plan["caption"])
             finally:
                 a.unhost_images(branch)
-            note(f"{p.stem} OK dry ({len(children)} images prêtes)")
+            note(f"{p.stem} OK dry ({len(urls)} éléments prêts)")
         else:
             a.cmd_publish(str(p))
             note(f"{p.stem} OK publié")

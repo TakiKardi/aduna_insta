@@ -2,8 +2,9 @@
 """Aduna -> Instagram : outils du pipeline.
 
 Claude fait le tri et les légendes. Ce script fait le reste :
-  scan                 lit l'album iCloud, télécharge les nouvelles photos
-  prepare GUID...      fabrique des JPEG au bon ratio pour Instagram
+  scan                 lit l'album iCloud, télécharge les nouvelles photos et vidéos
+  prepare GUID...      fabrique des JPEG (ou des MP4) au bon ratio pour Instagram
+  frames GUID...       extrait 4 images de chaque vidéo, pour choisir la légende
   publish PLAN.json    héberge les images, publie, met à jour le journal
   quota                cadence du jour (combien de posts on a le droit de faire)
 
@@ -35,6 +36,9 @@ OUT = ROOT / "out"          # JPEG prêts pour Instagram
 
 MIN_RATIO, MAX_RATIO = 4 / 5, 1.91  # largeur / hauteur acceptés par Instagram
 MAX_WIDTH = 1440
+REEL_MIN_RATIO = 9 / 16             # une vidéo seule part en Reel, plein écran vertical accepté
+VIDEO_MAX_WIDTH = 1080
+CAROUSEL_VIDEO_MAX_S = 60           # au-delà, une vidéo ne peut pas entrer dans un carrousel
 
 
 # ---------- journal ----------
@@ -68,6 +72,10 @@ def fetch_album():
     res = _ck_post(f"https://ckdatabasews.icloud.com/{CK}/public/records/resolve"
                    "?remapEnums=true&getCurrentSyncToken=true",
                    {"shortGUIDs": [{"value": ALBUM_TOKEN}]})["results"][0]
+    if res.get("serverErrorCode") or "anonymousPublicAccess" not in res:
+        # album supprimé, lien régénéré ou partage public coupé : inutile d'aller plus loin
+        sys.exit(f"Album iCloud introuvable ({res.get('serverErrorCode')}: {res.get('reason')}). "
+                 f"Vérifier le lien partagé et mettre à jour ALBUM_TOKEN.")
     zone = res["rootRecord"]["zoneID"] if "rootRecord" in res else res["zoneID"]
     token = res["anonymousPublicAccess"]["token"]
     base = res["anonymousPublicAccess"].get("databasePartition") or res["databasePartition"]
@@ -90,18 +98,22 @@ def fetch_album():
         f = asset.get("fields", {})
         master = masters.get(f.get("masterRef", {}).get("value", {}).get("recordName"), {})
         mf = master.get("fields", {})
-        if "movie" in str(mf.get("itemType", {}).get("value", "")):
-            continue  # pas de vidéo
-        res_ = f.get("resJPEGMedRes") or mf.get("resJPEGMedRes")
+        is_video = "movie" in str(mf.get("itemType", {}).get("value", ""))
+        if is_video:
+            # retouchée d'abord, puis l'original ; ffmpeg remet tout au format Instagram
+            res_ = (f.get("resVidFullRes") or mf.get("resVidFullRes")
+                    or f.get("resVidMedRes") or mf.get("resVidMedRes") or mf.get("resOriginalRes"))
+        else:
+            res_ = f.get("resJPEGMedRes") or mf.get("resJPEGMedRes")
         if not res_:
             continue
-        dl = res_["value"]["downloadURL"].replace("${f}", "photo.jpg")
+        dl = res_["value"]["downloadURL"].replace("${f}", "video.mov" if is_video else "photo.jpg")
         out.append({
             "guid": asset["recordName"],
             "date": f.get("assetDate", {}).get("value"),
             "by": asset.get("created", {}).get("userRecordName"),
             "url": dl,
-            "is_video": False,
+            "is_video": is_video,
         })
     return out
 
@@ -111,13 +123,16 @@ def cmd_scan():
     CACHE.mkdir(exist_ok=True)
     new = []
     for a in fetch_album():
-        if a["guid"] in j["photos"] or a["is_video"]:
+        if a["guid"] in j["photos"]:
             continue
-        dest = CACHE / f"{a['guid']}.jpg"
-        r = requests.get(a["url"], timeout=60)
-        r.raise_for_status()
-        dest.write_bytes(r.content)
-        j["photos"][a["guid"]] = {"status": "new", "date": a["date"], "by": a["by"], "file": str(dest)}
+        dest = CACHE / f"{a['guid']}.{'mov' if a['is_video'] else 'jpg'}"
+        with requests.get(a["url"], timeout=300, stream=True) as r:
+            r.raise_for_status()
+            with dest.open("wb") as fh:
+                for chunk in r.iter_content(1 << 20):
+                    fh.write(chunk)
+        j["photos"][a["guid"]] = {"status": "new", "date": a["date"], "by": a["by"], "file": str(dest),
+                                  "kind": "video" if a["is_video"] else "photo"}
         new.append(str(dest))
     save_journal(j)
     pending = [g for g, p in j["photos"].items() if p["status"] == "new"]
@@ -146,14 +161,84 @@ def fit_ratio(img):
     return img
 
 
+def is_video(entry):
+    return entry.get("kind") == "video"
+
+
+def out_file(guid, entry):
+    return OUT / f"{guid}.{'mp4' if is_video(entry) else 'jpg'}"
+
+
+def probe(path):
+    """Largeur, hauteur (rotation iPhone comprise), durée et présence de son."""
+    info = json.loads(subprocess.run(
+        ["ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", str(path)],
+        check=True, capture_output=True, text=True).stdout)
+    v = next(s for s in info["streams"] if s["codec_type"] == "video")
+    w, h = v["width"], v["height"]
+    rot = int(v.get("tags", {}).get("rotate", 0))
+    for sd in v.get("side_data_list", []):
+        rot = int(sd.get("rotation", rot))
+    if abs(rot) % 180 == 90:
+        w, h = h, w
+    return {"w": w, "h": h, "duration": float(info["format"]["duration"]),
+            "audio": any(s["codec_type"] == "audio" for s in info["streams"])}
+
+
+def fit_video(src, dest, min_ratio):
+    """Même règle que les photos : bandes noires, jamais de recadrage.
+    Sortie H.264 + AAC, 30 i/s max, 1080 px de large max, lisible par Instagram."""
+    p = probe(src)
+    r = p["w"] / p["h"]
+    if r < min_ratio:
+        w2, h2 = round(p["h"] * min_ratio), p["h"]
+    elif r > MAX_RATIO:
+        w2, h2 = p["w"], round(p["w"] / MAX_RATIO)
+    else:
+        w2, h2 = p["w"], p["h"]
+    scale = min(1, VIDEO_MAX_WIDTH / w2)
+    W, H = 2 * round(w2 * scale / 2), 2 * round(h2 * scale / 2)  # H.264 veut des dimensions paires
+    vf = (f"scale={W}:{H}:force_original_aspect_ratio=decrease:force_divisible_by=2,"
+          f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:black,fps=fps='min(source_fps,30)',format=yuv420p")
+    cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(src)]
+    if not p["audio"]:  # Instagram préfère une piste son, même muette
+        cmd += ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-shortest"]
+    cmd += ["-vf", vf, "-c:v", "libx264", "-preset", "medium", "-crf", "21", "-profile:v", "high",
+            "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-movflags", "+faststart", str(dest)]
+    subprocess.run(cmd, check=True)
+    return p["duration"]
+
+
 def cmd_prepare(guids):
+    """Une vidéo seule est préparée pour un Reel (jusqu'au 9:16) ; dans un carrousel, 4:5 minimum."""
     j = load_journal()
     OUT.mkdir(exist_ok=True)
+    reel = len(guids) == 1
     for g in guids:
-        src = Path(j["photos"][g]["file"])
-        dest = OUT / f"{g}.jpg"
-        fit_ratio(Image.open(src)).save(dest, "JPEG", quality=92)
+        e = j["photos"][g]
+        dest = out_file(g, e)
+        if is_video(e):
+            e["duration"] = fit_video(e["file"], dest, REEL_MIN_RATIO if reel else MIN_RATIO)
+            e["prepared_for"] = "reel" if reel else "carousel"
+        else:
+            fit_ratio(Image.open(e["file"])).save(dest, "JPEG", quality=92)
         print(dest)
+    save_journal(j)
+
+
+def cmd_frames(guids):
+    """Quatre images réparties sur la vidéo : de quoi choisir ses un ou deux mots."""
+    j = load_journal()
+    for g in guids:
+        src = j["photos"][g]["file"]
+        d = OUT / f"{g}-frames"
+        d.mkdir(parents=True, exist_ok=True)
+        dur = probe(src)["duration"]
+        for i in range(4):
+            t = dur * (i + 0.5) / 4
+            subprocess.run(["ffmpeg", "-y", "-v", "error", "-ss", f"{t:.2f}", "-i", src, "-frames:v", "1",
+                            "-vf", "scale=720:-2", str(d / f"{i + 1}.jpg")], check=True)
+        print(d)
 
 
 # ---------- hébergement ----------
@@ -209,29 +294,63 @@ def ig(method, path, **params):
     return r.json()
 
 
-def wait_ready(container_id):
-    for _ in range(30):
-        s = ig("GET", container_id, fields="status_code")["status_code"]
-        if s == "FINISHED":
+def wait_ready(container_id, tries=30):
+    """Une image est prête en quelques secondes ; une vidéo peut demander plusieurs minutes."""
+    for _ in range(tries):
+        r = ig("GET", container_id, fields="status_code,status")
+        if r["status_code"] == "FINISHED":
             return
-        if s == "ERROR":
-            raise RuntimeError(f"Conteneur {container_id} en erreur")
+        if r["status_code"] == "ERROR":
+            raise RuntimeError(f"Conteneur {container_id} en erreur : {r.get('status')}")
         time.sleep(5)
     raise RuntimeError(f"Conteneur {container_id} jamais prêt")
 
 
-def publish_post(image_urls, caption):
-    if len(image_urls) == 1:
-        cid = ig("POST", f"{IG_USER_ID}/media", image_url=image_urls[0], caption=caption)["id"]
+def create_containers(items, caption):
+    """items = [(url, "photo" | "video"), ...]. Renvoie le conteneur final, prêt à publier.
+    Une vidéo seule devient un Reel (partagé aussi dans la grille)."""
+    has_video = any(k == "video" for _, k in items)
+    tries = 120 if has_video else 30
+    if len(items) == 1:
+        url, kind = items[0]
+        if kind == "video":
+            cid = ig("POST", f"{IG_USER_ID}/media", media_type="REELS", video_url=url,
+                     caption=caption, share_to_feed="true")["id"]
+        else:
+            cid = ig("POST", f"{IG_USER_ID}/media", image_url=url, caption=caption)["id"]
     else:
-        children = [ig("POST", f"{IG_USER_ID}/media", image_url=u, is_carousel_item="true")["id"]
-                    for u in image_urls]
+        children = []
+        for url, kind in items:
+            media = {"media_type": "VIDEO", "video_url": url} if kind == "video" else {"image_url": url}
+            children.append(ig("POST", f"{IG_USER_ID}/media", is_carousel_item="true", **media)["id"])
         for c in children:
-            wait_ready(c)
+            wait_ready(c, tries)
         cid = ig("POST", f"{IG_USER_ID}/media", media_type="CAROUSEL",
                  children=",".join(children), caption=caption)["id"]
-    wait_ready(cid)
-    return ig("POST", f"{IG_USER_ID}/media_publish", creation_id=cid)["id"]
+    wait_ready(cid, tries)
+    return cid
+
+
+def publish_post(items, caption):
+    return ig("POST", f"{IG_USER_ID}/media_publish", creation_id=create_containers(items, caption))["id"]
+
+
+def check_plan(plan, j):
+    """Refuse un plan qu'Instagram rejetterait : fichier manquant, vidéo trop longue en carrousel,
+    vidéo préparée pour un Reel mise dans un carrousel (ou l'inverse)."""
+    guids = plan["guids"]
+    if not 1 <= len(guids) <= 10:
+        raise ValueError("un post compte de 1 à 10 éléments")
+    for g in guids:
+        e = j["photos"][g]
+        if not out_file(g, e).exists():
+            raise ValueError(f"{g} pas préparé : lancer prepare")
+        if is_video(e):
+            want = "reel" if len(guids) == 1 else "carousel"
+            if e.get("prepared_for") != want:
+                raise ValueError(f"{g} préparé pour {e.get('prepared_for')}, relancer prepare avec ce groupe")
+            if want == "carousel" and e.get("duration", 0) > CAROUSEL_VIDEO_MAX_S:
+                raise ValueError(f"{g} dure {e['duration']:.0f} s : trop long pour un carrousel, en faire un Reel")
 
 
 def cmd_publish(plan_path):
@@ -239,13 +358,15 @@ def cmd_publish(plan_path):
     À lancer seulement après le feu vert de Theophile."""
     plan = json.loads(Path(plan_path).read_text())
     j = load_journal()
-    files = [OUT / f"{g}.jpg" for g in plan["guids"]]
-    branch, urls = host_images(files)
+    check_plan(plan, j)
+    entries = [j["photos"][g] for g in plan["guids"]]
+    branch, urls = host_images([out_file(g, e) for g, e in zip(plan["guids"], entries)])
+    items = [(u, e.get("kind", "photo")) for u, e in zip(urls, entries)]
     caption = plan["caption"]
     if plan.get("hashtags"):
         caption += "\n\n" + " ".join(plan["hashtags"])
     try:
-        media_id = publish_post(urls, caption)
+        media_id = publish_post(items, caption)
     finally:
         unhost_images(branch)  # Instagram a sa copie, on efface la nôtre
     now = datetime.now(timezone.utc).isoformat()
@@ -282,6 +403,7 @@ if __name__ == "__main__":
     cmd, *args = sys.argv[1:] or ["help"]
     {"scan": lambda: cmd_scan(),
      "prepare": lambda: cmd_prepare(args),
+     "frames": lambda: cmd_frames(args),
      "publish": lambda: cmd_publish(args[0]),
      "quota": lambda: cmd_quota(),
      }.get(cmd, lambda: print(__doc__))()
