@@ -498,15 +498,14 @@ def cmd_publish(plan_path):
 
 # ---------- cadence ----------
 
+MAX_POSTS_PER_DAY = 9  # relevé de 3 à 9 par Theophile le 2026-10-30
+# Créneaux, heure de Paris, au moins 1 h 15 d'écart pour ne pas réveiller l'anti-spam d'Instagram
+SLOTS = ["09:00", "10:30", "12:30", "14:00", "15:30", "17:00", "18:45", "20:15", "21:30"]
+
+
 def posts_allowed(pending):
-    """0 photo : rien. 1-3 : 1 post. 4-8 : 2 posts. Au-delà : 3, jamais plus."""
-    if pending == 0:
-        return 0
-    if pending <= 3:
-        return 1
-    if pending <= 8:
-        return 2
-    return 3
+    """Un post par élément en attente au plus (un carrousel en regroupe plusieurs), plafonné à 9."""
+    return min(MAX_POSTS_PER_DAY, pending)
 
 
 def cmd_quota():
