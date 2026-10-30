@@ -81,9 +81,15 @@ def fetch_album_sharedstreams(token):
        la première réponse peut être un 330 qui indique le bon serveur ;
     2) webasseturls donne l'URL de téléchargement de chaque dérivé choisi."""
     host = "p23-sharedstreams.icloud.com"
-    for _ in range(3):
-        r = requests.post(f"https://{host}/{token}/sharedstreams/webstream",
-                          data=json.dumps({"streamCtag": None}), timeout=30)
+    for attempt in range(4):
+        try:  # un gros album peut mettre du temps à répondre
+            r = requests.post(f"https://{host}/{token}/sharedstreams/webstream",
+                              data=json.dumps({"streamCtag": None}), timeout=120)
+        except requests.exceptions.Timeout:
+            if attempt == 3:
+                raise
+            time.sleep(10)
+            continue
         if r.status_code == 330:
             host = r.json()["X-Apple-MMe-Host"]
             continue
@@ -109,7 +115,7 @@ def fetch_album_sharedstreams(token):
     urls = {}
     for i in range(0, len(guids), 25):
         items = requests.post(f"{base}/webasseturls", data=json.dumps({"photoGuids": guids[i:i + 25]}),
-                              timeout=30).json().get("items", {})
+                              timeout=120).json().get("items", {})
         urls.update({k: f"https://{v['url_location']}{v['url_path']}" for k, v in items.items()})
     out = []
     for g, (ph, checksum, is_video) in picked.items():
@@ -188,19 +194,32 @@ def dhash(path):
     return [px[r * 17 + c] > px[r * 17 + c + 1] for r in range(16) for c in range(16)]
 
 
+def date_ms(d):
+    """Date de prise de vue en ms depuis 1970, qu'elle soit déjà en ms (CloudKit) ou en ISO."""
+    if d is None or isinstance(d, (int, float)):
+        return d
+    return int(datetime.fromisoformat(d.replace("Z", "+00:00")).timestamp() * 1000)
+
+
+_hashes = {}  # empreintes des photos du journal, calculées une fois par scan
+
+
 def known_twin(j, entry, path):
     """Le même cliché déjà au journal sous un autre identifiant (l'album a changé de lien) ?
     D'abord par la date de prise de vue, puis, pour une photo, par son empreinte."""
     if entry["date"]:
         for g, p in j["photos"].items():
-            if p.get("date") and abs(p["date"] - entry["date"]) <= 2000 and p.get("kind", "photo") == entry["kind"]:
+            if p.get("date") and abs(date_ms(p["date"]) - entry["date"]) <= 2000 \
+                    and p.get("kind", "photo") == entry["kind"]:
                 return g
     if entry["kind"] == "photo" and path:
         h = dhash(path)
         for g, p in j["photos"].items():
             f = Path(p["file"])
             if p.get("kind", "photo") == "photo" and f.exists():
-                if sum(x != y for x, y in zip(h, dhash(f))) <= 8:  # deux photos différentes : 37 et plus
+                if g not in _hashes:
+                    _hashes[g] = dhash(f)
+                if sum(x != y for x, y in zip(h, _hashes[g])) <= 8:  # deux photos différentes : 37 et plus
                     return g
     return None
 
@@ -208,6 +227,8 @@ def known_twin(j, entry, path):
 def cmd_scan():
     j = load_journal()
     j.setdefault("aliases", {})
+    for p in j["photos"].values():  # un ancien scan a pu écrire des dates ISO
+        p["date"] = date_ms(p.get("date"))
     CACHE.mkdir(exist_ok=True)
     new = []
     for a in fetch_album():
