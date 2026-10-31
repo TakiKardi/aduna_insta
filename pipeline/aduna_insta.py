@@ -498,9 +498,10 @@ def cmd_publish(plan_path):
 
 # ---------- cadence ----------
 
-MAX_POSTS_PER_DAY = 9  # relevé de 3 à 9 par Theophile le 2026-10-30
-# Créneaux, heure de Paris, au moins 1 h 15 d'écart pour ne pas réveiller l'anti-spam d'Instagram
-SLOTS = ["09:00", "10:30", "12:30", "14:00", "15:30", "17:00", "18:45", "20:15", "21:30"]
+MAX_POSTS_PER_DAY = 10  # 3, puis 9 le 2026-10-30, puis 10 avec le créneau de nuit le 2026-10-31
+# Créneaux, heure de Paris, au moins 1 h 15 d'écart pour ne pas réveiller l'anti-spam d'Instagram ;
+# 03:00 garde moins de 6 h entre deux posts, même la nuit
+SLOTS = ["03:00", "09:00", "10:30", "12:30", "14:00", "15:30", "17:00", "18:45", "20:15", "21:30"]
 
 
 def posts_allowed(pending):
