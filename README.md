@@ -11,7 +11,7 @@ Publication automatique des photos du chantier d'Aduna sur Instagram ([@aduna.se
 
 ## Le code
 
-- `pipeline/aduna_insta.py` : `scan` (lecture de l'album iCloud via CloudKit, photos et vidéos), `prepare` (bandes noires si le ratio sort de 4:5 à 1,91:1, jamais de recadrage ; vidéos réencodées en MP4), `frames` (quatre images d'une vidéo pour choisir sa légende), `publish` (hébergement temporaire et publication via l'API Instagram), `quota` (cadence du jour).
+- `pipeline/aduna_insta.py` : `scan` (lecture de l'album iCloud, lien « Site web public » ou lien CloudKit, photos et vidéos ; les éléments déjà publiés sont reconnus par date ou par empreinte), `prepare` (bandes noires si le ratio sort de 4:5 à 1,91:1, jamais de recadrage ; vidéos réencodées en MP4), `frames` (quatre images d'une vidéo pour choisir sa légende), `publish` (hébergement temporaire et publication via l'API Instagram), `quota` (cadence du jour).
 
 ## Vidéos
 
