@@ -498,10 +498,10 @@ def cmd_publish(plan_path):
 
 # ---------- cadence ----------
 
-MAX_POSTS_PER_DAY = 10  # 3, puis 9 le 2026-10-30, puis 10 avec le créneau de nuit le 2026-10-31
+MAX_POSTS_PER_DAY = 3  # 3, monté à 10 fin octobre, redescendu à 3 le 2026-11-01 (demande du capitaine)
 # Créneaux, heure de Paris, au moins 1 h 15 d'écart pour ne pas réveiller l'anti-spam d'Instagram ;
 # 03:00 garde moins de 6 h entre deux posts, même la nuit
-SLOTS = ["03:00", "09:00", "10:30", "12:30", "14:00", "15:30", "17:00", "18:45", "20:15", "21:30"]
+SLOTS = ["12:30", "18:45", "20:15"]
 
 
 def posts_allowed(pending):
